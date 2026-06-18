@@ -375,6 +375,52 @@ protocol UploadSessionDelegate: AnyObject {
 
 // MARK: - Upload Session
 
+/// Tracks completed bytes plus per-part in-flight bytes so `upload-progress`
+/// events never move backward when parallel parts finish out of order or a
+/// failed task is dropped.
+///
+/// Not thread-safe on its own; the owner (`UploadSession`) serializes every
+/// access on its private `queue`.
+struct ProgressAccumulator {
+    let totalBytes: Int64
+    private var inFlight: [Int: Int64] = [:]
+    private var completedBytes: Int64 = 0
+    // Starts at 0 (not -1) so nextEmit() suppresses a redundant 0-byte event
+    // before any bytes are sent — the upload-started event already covers that.
+    private var lastEmittedBytes: Int64 = 0
+
+    /// Bytes sent so far for `chunk` on the current task (absolute, not a delta).
+    mutating func onBytes(_ chunk: Int, sentSoFar: Int64) {
+        inFlight[chunk] = sentSoFar
+    }
+
+    /// Fold a completed part's full size into the running total; drop its in-flight entry.
+    mutating func onComplete(_ chunk: Int, size: Int64) {
+        completedBytes += size
+        inFlight.removeValue(forKey: chunk)
+    }
+
+    /// Drop a failed task without crediting its in-flight bytes.
+    mutating func onDrop(_ chunk: Int) {
+        inFlight.removeValue(forKey: chunk)
+    }
+
+    /// Current best estimate, clamped to totalBytes. Private so callers can't
+    /// bypass the monotonic high-water guarantee of `nextEmit()`.
+    private func current() -> Int64 {
+        min(completedBytes + inFlight.values.reduce(0, +), totalBytes)
+    }
+
+    /// The current byte count, but only when it advances past the high-water
+    /// mark; otherwise nil. Callers emit progress iff non-nil.
+    mutating func nextEmit() -> Int64? {
+        let now = current()
+        if now <= lastEmittedBytes { return nil }
+        lastEmittedBytes = now
+        return now
+    }
+}
+
 class UploadSession: NSObject {
     
     enum State: String {
@@ -400,7 +446,10 @@ class UploadSession: NSObject {
     private(set) var state: State = .idle
     private(set) var bytesUploaded: Int64 = 0
     private(set) var isPaused = false
-    
+    private var progressAcc: ProgressAccumulator
+    private var lastSubChunkEmitAt: TimeInterval = 0
+    private static let subChunkEmitMinIntervalSec: TimeInterval = 0.1  // ~10 Hz
+
     weak var delegate: UploadSessionDelegate?
     
     private var continuation: CheckedContinuation<UploadResult, Error>?
@@ -412,7 +461,14 @@ class UploadSession: NSObject {
         guard totalBytes > 0 else { return 0 }
         return Double(bytesUploaded) / Double(totalBytes)
     }
-    
+
+    /// Emits progress through the shared estimator iff it advanced. Must run on `queue`.
+    private func emitProgressIfAdvanced() {
+        guard let bytes = progressAcc.nextEmit() else { return }
+        let p = totalBytes > 0 ? Double(bytes) / Double(totalBytes) : 0
+        delegate?.uploadSession(self, didUpdateProgress: p, bytesUploaded: bytes)
+    }
+
     init(
         uploadId: String,
         filePath: String,
@@ -448,7 +504,8 @@ class UploadSession: NSObject {
         }
         
         self.totalBytes = fileSize
-        
+        self.progressAcc = ProgressAccumulator(totalBytes: fileSize)
+
         // Calculate chunk size with minimum 5 MB enforcement for S3 compatibility
         let calculatedChunkSize = Int64(ceil(Double(fileSize) / Double(uploadUrls.count)))
         self.chunkSize = max(calculatedChunkSize, UploadSession.minimumChunkSize)
@@ -704,8 +761,9 @@ extension UploadSession: URLSessionTaskDelegate, URLSessionDataDelegate {
             
             if let error = error {
                 print("⚠️ Chunk \(index) failed: \(error.localizedDescription)")
+                self.progressAcc.onDrop(index)
                 self.delegate?.uploadSession(self, didFailChunk: index, error: error)
-                
+
                 if self.activeTasks.isEmpty && self.completedChunks.count < self.uploadUrls.count {
                     self.fail(with: error)
                 }
@@ -717,8 +775,9 @@ extension UploadSession: URLSessionTaskDelegate, URLSessionDataDelegate {
                 let error = NSError(domain: "CloudUploader", code: -1,
                                   userInfo: [NSLocalizedDescriptionKey: "Chunk \(index) failed"])
                 print("⚠️ Chunk \(index) bad response")
+                self.progressAcc.onDrop(index)
                 self.delegate?.uploadSession(self, didFailChunk: index, error: error)
-                
+
                 if self.activeTasks.isEmpty && self.completedChunks.count < self.uploadUrls.count {
                     self.fail(with: error)
                 }
@@ -731,11 +790,14 @@ extension UploadSession: URLSessionTaskDelegate, URLSessionDataDelegate {
             
             self.etags[index] = etag
             self.completedChunks.insert(index)
-            
+
             let chunkSize = min(self.chunkSize, self.totalBytes - Int64(index) * self.chunkSize)
             self.bytesUploaded += chunkSize
-            
-            self.delegate?.uploadSession(self, didUpdateProgress: self.progress, bytesUploaded: self.bytesUploaded)
+            self.progressAcc.onComplete(index, size: chunkSize)
+
+            // Emit through the shared estimator so this completion includes any
+            // siblings still in flight and never dips below the last tick.
+            self.emitProgressIfAdvanced()
             self.delegate?.uploadSession(self, didCompleteChunk: index)
             
             if self.completedChunks.count == self.uploadUrls.count {
@@ -743,6 +805,23 @@ extension UploadSession: URLSessionTaskDelegate, URLSessionDataDelegate {
             } else {
                 self.uploadNextChunks()
             }
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64,
+                    totalBytesExpectedToSend: Int64) {
+        queue.async {
+            guard let index = self.activeTasks.first(where: { $0.value == task })?.key else { return }
+            // totalBytesSent is the per-task cumulative figure → set, don't add.
+            self.progressAcc.onBytes(index, sentSoFar: totalBytesSent)
+
+            // Throttle the emit (not the accumulator) to ~10 Hz.
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - self.lastSubChunkEmitAt >= Self.subChunkEmitMinIntervalSec else { return }
+            self.lastSubChunkEmitAt = now
+            self.emitProgressIfAdvanced()
         }
     }
 }
