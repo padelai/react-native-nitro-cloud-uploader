@@ -208,7 +208,10 @@ class NitroCloudUploader(
         var completedChunks: Int = 0,
         var totalChunks: Int = 0,
         val partETags: MutableMap<Int, String> = Collections.synchronizedMap(mutableMapOf()),
-        val failedChunks: MutableSet<Int> = Collections.synchronizedSet(mutableSetOf())
+        val failedChunks: MutableSet<Int> = Collections.synchronizedSet(mutableSetOf()),
+        // Single source of truth for every upload-progress emit (sub-chunk tick
+        // and part completion), kept monotonic via its high-water mark.
+        val progress: ProgressAccumulator = ProgressAccumulator(totalBytes)
     )
 
     init {
@@ -480,7 +483,27 @@ class NitroCloudUploader(
     ): UploadResult = withContext(Dispatchers.IO) {
         val state = uploadStates[uploadId] ?: throw IllegalStateException("Upload state not found")
         val uploadJob = activeUploads[uploadId] ?: throw IllegalStateException("Upload job not found")
-        
+
+        // Emit byte-level progress about 10 times per second while large parts
+        // are being written.
+        val progressEmitter = launch {
+            while (isActive) {
+                delay(100)
+                val bytes = state.progress.nextEmit() ?: continue
+                emitEvent(
+                    UploadProgressEvent(
+                        type = "upload-progress",
+                        uploadId = uploadId,
+                        progress = bytes.toDouble() / state.totalBytes,
+                        bytesUploaded = bytes.toDouble(),
+                        totalBytes = state.totalBytes.toDouble(),
+                        chunkIndex = null,
+                        errorMessage = null
+                    )
+                )
+            }
+        }
+
         try {
             // ✅ Calculate chunk size (match iOS logic)
             val calculatedChunkSize = Math.ceil(fileSize.toDouble() / uploadUrls.size).toLong()
@@ -547,7 +570,7 @@ class NitroCloudUploader(
             throw e
         } catch (e: Exception) {
             println("❌ Upload error: ${e.message}")
-            
+
             emitEvent(
                 UploadProgressEvent(
                     type = "upload-failed",
@@ -559,8 +582,10 @@ class NitroCloudUploader(
                     errorMessage = e.message
                 )
             )
-            
+
             throw e
+        } finally {
+            progressEmitter.cancel()
         }
     }
 
@@ -594,6 +619,7 @@ class NitroCloudUploader(
             // Check if cancelled
             if (!isActive) {
                 println("🛑 Upload cancelled")
+                state.progress.onDrop(part.partNumber)
                 return@withContext false
             }
 
@@ -603,7 +629,7 @@ class NitroCloudUploader(
                 // Stream the chunk from disk to avoid allocating the full part in memory.
                 val request = Request.Builder()
                     .url(part.url)
-                    .put(streamingFileChunkBody(filePath, part.offset, part.size))
+                    .put(streamingFileChunkBody(filePath, part.offset, part.size, state.progress, part.partNumber))
                     .addHeader("Content-Type", "application/octet-stream")
                     .build()
 
@@ -624,19 +650,25 @@ class NitroCloudUploader(
                     throw Exception("No ETag in response for part ${part.partNumber}")
                 }
 
-                // ✅ Update state - double-check not already counted
+                // ✅ Update state - double-check not already counted.
+                // Keep the completed byte count and in-flight cleanup together
+                // so a progress snapshot cannot count the same part twice.
                 synchronized(state) {
                     if (!state.partETags.containsKey(part.partNumber)) {
                         state.partETags[part.partNumber] = etag
                         state.completedChunks++
                         state.bytesUploaded += part.size
                         state.failedChunks.remove(part.partNumber)
+                        state.progress.onComplete(part.partNumber, part.size)
                     } else {
+                        // Already counted on a prior path: drop any in-flight
+                        // entry so it can't keep inflating current() estimates.
+                        state.progress.onDrop(part.partNumber)
                         println("⚠️ Part ${part.partNumber} was already marked as completed, skipping state update")
                     }
                 }
 
-                val progress = state.bytesUploaded.toDouble() / state.totalBytes
+                val progressFraction = state.bytesUploaded.toDouble() / state.totalBytes
 
                 println("✅ Part ${part.partNumber} uploaded - ETag: $etag (${state.completedChunks}/${state.totalChunks})")
 
@@ -653,20 +685,24 @@ class NitroCloudUploader(
                     )
                 )
 
-                emitEvent(
-                    UploadProgressEvent(
-                        type = "upload-progress",
-                        uploadId = uploadId,
-                        progress = progress,
-                        bytesUploaded = state.bytesUploaded.toDouble(),
-                        totalBytes = state.totalBytes.toDouble(),
-                        chunkIndex = null,
-                        errorMessage = null
+                // Emit through the shared estimator so this completion includes
+                // siblings' in-flight bytes and never dips below the last tick.
+                state.progress.nextEmit()?.let { bytes ->
+                    emitEvent(
+                        UploadProgressEvent(
+                            type = "upload-progress",
+                            uploadId = uploadId,
+                            progress = bytes.toDouble() / state.totalBytes,
+                            bytesUploaded = bytes.toDouble(),
+                            totalBytes = state.totalBytes.toDouble(),
+                            chunkIndex = null,
+                            errorMessage = null
+                        )
                     )
-                )
+                }
 
                 if (showNotification) {
-                    val progressPercent = (progress * 100).toInt()
+                    val progressPercent = (progressFraction * 100).toInt()
                     showNotification(uploadId, progressPercent, "Uploading... ${progressPercent}%")
                     
                     // ✅ Update foreground service notification
@@ -690,7 +726,11 @@ class NitroCloudUploader(
             } catch (e: Exception) {
                 lastError = e
                 retries++
-                
+                // Abandoned attempt: drop its in-flight bytes. The next retry's
+                // writeTo resets to 0; without this a failed-near-complete part
+                // would keep crediting bytes it never finished.
+                state.progress.onDrop(part.partNumber)
+
                 println("❌ Part ${part.partNumber} failed (attempt $retries): ${e.message}")
                 
                 if (retries < MAX_RETRIES) {
@@ -723,12 +763,22 @@ class NitroCloudUploader(
      * Each write uses a fixed-size buffer instead of allocating the full chunk.
      * The file is reopened for each write so the body can be replayed if OkHttp retries.
      */
-    private fun streamingFileChunkBody(filePath: String, offset: Long, size: Long): RequestBody {
+    private fun streamingFileChunkBody(
+        filePath: String,
+        offset: Long,
+        size: Long,
+        progress: ProgressAccumulator,
+        partNumber: Int,
+    ): RequestBody {
         val mediaType = "application/octet-stream".toMediaType()
         return object : RequestBody() {
             override fun contentType() = mediaType
             override fun contentLength() = size
             override fun writeTo(sink: okio.BufferedSink) {
+                // OkHttp may invoke writeTo more than once (retries); each call
+                // restarts at byte 0, so reset the in-flight tally up front.
+                var sent = 0L
+                progress.onBytes(partNumber, 0L)
                 RandomAccessFile(File(filePath), "r").use { raf ->
                     if (offset + size > raf.length()) {
                         throw IllegalArgumentException(
@@ -748,6 +798,8 @@ class NitroCloudUploader(
                         }
                         sink.write(buffer, 0, read)
                         remaining -= read
+                        sent += read
+                        progress.onBytes(partNumber, sent)
                     }
                 }
             }
